@@ -8,25 +8,13 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-
 namespace EntityFramework.BulkInsert.MySql
 {
-    public class MySqlBulkInsertProvider : ProviderBase<MySqlConnection, MySqlTransaction>
+    public class MySqlBulkUpdateProvider : ProviderBase<MySqlConnection, MySqlTransaction>
     {
-        public MySqlBulkInsertProvider()
+        public MySqlBulkUpdateProvider()
         {
             SetProviderIdentifier("MySql.Data.MySqlClient.MySqlConnection");
-        }
-
-        public override void Run<T>(IEnumerable<T> entities, MySqlTransaction transaction)
-        {
-            Run(entities, transaction.Connection, transaction);
-        }
-
-#if NET45
-        public override Task RunAsync<T>(IEnumerable<T> entities, MySqlTransaction transaction)
-        {
-            return RunAsync(entities, transaction.Connection, transaction);
         }
 
         public override object GetSqlGeography(string wkt, int srid)
@@ -40,104 +28,24 @@ namespace EntityFramework.BulkInsert.MySql
                 return null;
             return value;
         }
-#endif
+
+        public override void Run<T>(IEnumerable<T> entities, MySqlTransaction transaction)
+        {
+            Run(entities, transaction.Connection, transaction);
+        }
+
+        public override Task RunAsync<T>(IEnumerable<T> entities, MySqlTransaction transaction)
+        {
+            return RunAsync(entities, transaction.Connection, transaction);
+        }
 
         protected override MySqlConnection CreateConnection()
         {
             return new MySqlConnection(ConnectionString);
         }
-
         protected override string ConnectionString => DbConnection.ConnectionString;
 
-        private bool IsValidIdentityType(Type t)
-        {
-            switch (Type.GetTypeCode(t))
-            {
-                case TypeCode.Byte:
-                case TypeCode.SByte:
-                case TypeCode.UInt16:
-                case TypeCode.UInt32:
-                case TypeCode.UInt64:
-                case TypeCode.Int16:
-                case TypeCode.Int32:
-                case TypeCode.Int64:
-                    return true;
-                default:
-                    return false;
-            }
-        }
-
         private void Run<T>(IEnumerable<T> entities, MySqlConnection connection, MySqlTransaction transaction)
-        {
-            if (!entities.Any())
-                return ;
-
-            bool keepIdentity = (BulkCopyOptions.KeepIdentity & Options.BulkCopyOptions) > 0;
-            bool keepNulls = (BulkCopyOptions.KeepNulls & Options.BulkCopyOptions) > 0;
-
-            using (var reader = new MappedDataReader<T>(entities, this))
-            {
-                var tableEngine = GetTableEngine(connection.Database, reader.TableName, connection);
-
-                var columns = reader.Cols
-                    .Where(x => !x.Value.Computed && (!x.Value.IsIdentity || keepIdentity))
-                    .ToArray();
-
-                // INSERT INTO [TableName] (column list)
-                var insert = new StringBuilder()
-                    .Append($" INSERT INTO {reader.TableName} ")
-                    .Append("(")
-                    .Append(string.Join(",", columns.Select(col => col.Value.ColumnName)))
-                    .Append(")")
-                    .Append(" VALUES")
-                    .ToString();
-
-                int i = 0;
-                long rowsCopied = 0;
-                var rows = new List<string>();
-                while (reader.Read())
-                {
-                    var values = new List<string>();
-                    foreach (var col in columns)
-                    {
-                        var value = reader.GetValue(col.Key);
-                        var type = col.Value.Type;
-
-                        AddParameter(type, value, values);
-                    }
-
-                    rows.Add("(" + string.Join(",", values) + ")");
-
-                    i++;
-
-                    if (i == Options.BatchSize || i == Options.NotifyAfter)
-                    {
-                        using (var cmd = CreateCommand(CreateInsertBatchText(insert, rows, tableEngine), connection, transaction))
-                            cmd.ExecuteNonQueryAsync();
-
-                        if (Options.Callback != null)
-                        {
-                            int batches = Options.BatchSize / Options.NotifyAfter;
-
-                            rowsCopied += i;
-                            Options.Callback(this, new RowsCopiedEventArgs(rowsCopied));
-                        }
-
-                        i = 0;
-                        rows.Clear();
-                    }
-                }
-
-                if (rows.Any())
-                {
-                    using (var cmd = CreateCommand(CreateInsertBatchText(insert, rows, tableEngine), connection, transaction))
-                        cmd.ExecuteNonQuery();
-                }
-            }
-        }
-
-#if NET45
-        private async Task RunAsync<T>(IEnumerable<T> entities, MySqlConnection connection, MySqlTransaction transaction)
         {
             if (!entities.Any())
                 return;
@@ -147,42 +55,119 @@ namespace EntityFramework.BulkInsert.MySql
 
             using (var reader = new MappedDataReader<T>(entities, this))
             {
-                var tableEngine = await GetTableEngineAsync(connection.Database, reader.TableName, connection);
+                var tableEngine = GetTableEngine(connection.Database, reader.TableName, connection);
 
+                var keyColumns = reader.Cols
+                    .Where(x => !x.Value.Computed && x.Value.IsPk)
+                    .ToArray();
                 var columns = reader.Cols
-                    .Where(x => !x.Value.Computed && (!x.Value.IsIdentity || keepIdentity))
+                    .Where(x => !x.Value.Computed && !x.Value.IsPk && (!x.Value.IsIdentity || keepIdentity))
                     .ToArray();
 
-                // INSERT INTO [TableName] (column list)
-                var insert = new StringBuilder()
-                    .Append($" INSERT INTO {reader.TableName} ")
-                    .Append("(")
-                    .Append(string.Join(",", columns.Select(col => col.Value.ColumnName)))
-                    .Append(")")
-                    .Append(" VALUES")
-                    .ToString();
+                // UPDATE [TableName] (column list)
+                var updateHeader = $"UPDATE `{reader.TableName}` SET ";
+                var updateBuilder = new StringBuilder();
 
                 int i = 0;
                 long rowsCopied = 0;
-                var rows = new List<string>();
                 while (reader.Read())
                 {
-                    var values = new List<string>();
+                    updateBuilder.Append(updateHeader);
                     foreach (var col in columns)
                     {
                         var value = reader.GetValue(col.Key);
                         var type = col.Value.Type;
-
-                        AddParameter(type, value, values);
+                        updateBuilder.AppendFormat("{0}={1},", col.Value.ColumnName, AddParameter(type, value));
                     }
-
-                    rows.Add("(" + string.Join(",", values) + ")");
+                    updateBuilder.Remove(updateBuilder.Length - 1, 1);//remove last ,
+                    updateBuilder.Append(" WHERE ");
+                    foreach(var col in keyColumns)
+                    {
+                        var value = reader.GetValue(col.Key);
+                        var type = col.Value.Type;
+                        updateBuilder.AppendFormat("{0}={1} AND ", col.Value.ColumnName, AddParameter(type, value));
+                    }
+                    updateBuilder.Remove(updateBuilder.Length - 5, 5);//remove last AND
+                    updateBuilder.Append(";");
 
                     i++;
 
                     if (i == Options.BatchSize || i == Options.NotifyAfter)
                     {
-                        using (var cmd = CreateCommand(CreateInsertBatchText(insert, rows, tableEngine), connection, transaction))
+                        using (var cmd = CreateCommand(CreateUpdateBatchText(updateBuilder, tableEngine), connection, transaction))
+                            cmd.ExecuteNonQueryAsync();
+
+                        if (Options.Callback != null)
+                        {
+                            int batches = Options.BatchSize / Options.NotifyAfter;
+
+                            rowsCopied += i;
+                            Options.Callback(this, new RowsCopiedEventArgs(rowsCopied));
+                        }
+                        i = 0;
+                    }
+                }
+
+                if (i>0)
+                {
+                    using (var cmd = CreateCommand(CreateUpdateBatchText(updateBuilder, tableEngine), connection, transaction))
+                        cmd.ExecuteNonQuery();
+                }
+            }
+        }
+
+#if NET45
+        private async Task RunAsync<T>(IEnumerable<T> entities, MySqlConnection connection, MySqlTransaction transaction)
+        {
+            if (!entities.Any())
+                return ;
+
+            bool keepIdentity = (BulkCopyOptions.KeepIdentity & Options.BulkCopyOptions) > 0;
+            bool keepNulls = (BulkCopyOptions.KeepNulls & Options.BulkCopyOptions) > 0;
+
+            using (var reader = new MappedDataReader<T>(entities, this))
+            {
+                var tableEngine = await GetTableEngineAsync(connection.Database, reader.TableName, connection);
+
+                var keyColumns = reader.Cols
+                    .Where(x => !x.Value.Computed && x.Value.IsPk)
+                    .ToArray();
+                var columns = reader.Cols
+                    .Where(x => !x.Value.Computed && !x.Value.IsPk && (!x.Value.IsIdentity || keepIdentity))
+                    .ToArray();
+
+                // UPDATE [TableName] (column list)
+                var updateHeader = $"UPDATE `{reader.TableName}` SET ";
+                var updateBuilder = new StringBuilder();
+
+                int i = 0;
+                long rowsCopied = 0;
+
+                while (reader.Read())
+                {
+                    updateBuilder.Append(updateHeader);
+                    foreach (var col in columns)
+                    {
+                        var value = reader.GetValue(col.Key);
+                        var type = col.Value.Type;
+                        updateBuilder.AppendFormat("{0}={1},", col.Value.ColumnName, AddParameter(type, value));
+                    }
+                    updateBuilder.Remove(updateBuilder.Length - 1, 1);//remove last ,
+                    updateBuilder.Append(" WHERE ");
+                    foreach (var col in keyColumns)
+                    {
+                        var value = reader.GetValue(col.Key);
+                        var type = col.Value.Type;
+                        updateBuilder.AppendFormat("{0}={1} AND ", col.Value.ColumnName, AddParameter(type, value));
+                    }
+                    updateBuilder.Remove(updateBuilder.Length - 5, 5);//remove last AND
+                    updateBuilder.Append(";");
+
+                    i++;
+
+                    if (i == Options.BatchSize || i == Options.NotifyAfter)
+                    {
+                        using (var cmd = CreateCommand(CreateUpdateBatchText(updateBuilder, tableEngine), connection, transaction))
                             await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
 
                         if (Options.Callback != null)
@@ -194,20 +179,19 @@ namespace EntityFramework.BulkInsert.MySql
                         }
 
                         i = 0;
-                        rows.Clear();
                     }
                 }
 
-                if (rows.Any())
+                if (i>0)
                 {
-                    using (var cmd = CreateCommand(CreateInsertBatchText(insert, rows, tableEngine), connection, transaction))
+                    using (var cmd = CreateCommand(CreateUpdateBatchText(updateBuilder, tableEngine), connection, transaction))
                         await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
                 }
             }
         }
 #endif
 
-        private void AddParameter(Type type, object value, List<string> values)
+        private string AddParameter(Type type,object value)
         {
             if (type == null
                 || type == typeof(string)
@@ -216,54 +200,54 @@ namespace EntityFramework.BulkInsert.MySql
             {
                 if (value == null)
                 {
-                    values.Add("NULL");
+                    return "NULL";
                 }
                 else
                 {
-                    values.Add($"'{MySqlHelper.EscapeString(value.ToString())}'");
+                    return $"'{MySqlHelper.EscapeString(value.ToString())}'";
                 }
             }
-            else if (IsDateType(type))
+
+            if (IsDateType(type))
             {
                 if (value == null)
                 {
-                    values.Add("NULL");
+                    return "NULL";
                 }
                 else
                 {
                     const string dateTimePattern = "yyyy-MM-dd HH:mm:ss.ffffff";
                     if (value is DateTime dt)
                     {
-                        values.Add($"'{MySqlHelper.EscapeString(dt.ToString(dateTimePattern))}'");
+                        return $"'{MySqlHelper.EscapeString(dt.ToString(dateTimePattern))}'";
                     }
                     else if (value is DateTimeOffset dt2)
                     {
-                        values.Add($"'{MySqlHelper.EscapeString(dt2.ToString(dateTimePattern))}'");
+                        return $"'{MySqlHelper.EscapeString(dt2.ToString(dateTimePattern))}'";
                     }
                 }
             }
-            else if (type.IsEnum)
+
+            if (type.IsEnum)
             {
                 if (value == null)
                 {
-                    values.Add("NULL");
+                    return "NULL";
                 }
                 else
                 {
                     var enumUnderlyingType = type.GetEnumUnderlyingType();
-                    values.Add(Convert.ChangeType(value, enumUnderlyingType).ToString());
+                    return Convert.ChangeType(value, enumUnderlyingType).ToString();
                 }
+            }
+
+            if (value == null)
+            {
+                return "NULL";
             }
             else
             {
-                if (value == null)
-                {
-                    values.Add("NULL");
-                }
-                else
-                {
-                    values.Add(value.ToString());
-                }
+                return value.ToString();
             }
         }
 
@@ -281,14 +265,9 @@ namespace EntityFramework.BulkInsert.MySql
             return cmd;
         }
 
-        private string CreateInsertBatchText(string insertHeader, List<string> rows, MySqlEngine engine)
+        private string CreateUpdateBatchText(StringBuilder updateSql, MySqlEngine engine)
         {
-            return GenerateSql(engine, Options.BulkCopyOptions, () => insertHeader + " " + string.Join(",", rows) + ";");
-            //return new StringBuilder(insertHeader)
-            //    .Append(string.Join(",", rows))
-            //    .Append(";")
-            //    .AppendLine("COMMIT;")
-            //    .ToString();
+            return GenerateSql(engine, Options.BulkCopyOptions, () => updateSql.ToString());
         }
 
         private MySqlEngine GetTableEngine(string schemaName, string tableName, MySqlConnection connection)
@@ -363,12 +342,14 @@ SET foreign_key_checks=0;
 {statementGenerator()}
 COMMIT;
 SET unique_checks=1;
-SET foreign_key_checks=1;";
+SET foreign_key_checks=1;
+SET autocommit=1";
             }
             return $@"
 SET autocommit=0;
 {statementGenerator()}
-COMMIT;";
+COMMIT;
+SET autocommit=1;";
         }
     }
 }

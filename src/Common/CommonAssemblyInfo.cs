@@ -22,6 +22,6 @@
 [assembly: AssemblyFileVersion("5.0.0.19")]
 #endif
 #if EF6
-[assembly: AssemblyVersion("6.0.3.6")]
-[assembly: AssemblyFileVersion("6.0.3.6")]
+[assembly: AssemblyVersion("6.0.4")]
+[assembly: AssemblyFileVersion("6.0.4")]
 #endif
